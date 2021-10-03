@@ -112,6 +112,10 @@ class SirenImageLearner(pl.LightningModule):
         #tb.add_histogram('loss_grad', loss.grad, batch_idx) # uh....
         self.log("train_loss", loss)
         
+        #######################
+        # Should I be using callbacks for this logging stuff?
+        # I don't want to build these images every step, just when I want to log....
+        
         # fuck it...
         idx0=batch['coords']
         im_recons=torch.sparse_coo_tensor(
@@ -130,14 +134,42 @@ class SirenImageLearner(pl.LightningModule):
             device=torch.device(DEVICE) #device=DEVICE
         ).to_dense().unsqueeze(0)
         
-        #tb.add_image('pred', im_pred, batch_idx)
-        #tb.add_image('pred', im_pred)
         tb.add_image('pred', im_pred, self.global_step)
         
-        # For debugging the nan loss
-        #self.log('y_pred.shape', torch.tensor(y_pred.shape), batch_idx)
-        #self.log('y_true.shape', torch.tensor(y_true.shape), batch_idx)
+        # what happens if we generate an image solely using the coordinates between the training points?
+        with torch.no_grad():
+            #shape_orig = tuple(idx0.max(dim=0).values+1)
+            shape_impute = tuple(idx0.max(dim=0).values)
+            idx_impute = make_idx_from_shape(shape_impute)
+            y_impute = self.forward(idx_impute['coords_rescaled']).squeeze()
+            
+            im_impute = torch.sparse_coo_tensor(
+                indices = idx_impute['coords'].T, 
+                values = y_impute,
+                size = shape_impute,
+                device = torch.device(DEVICE) #device=DEVICE
+            ).to_dense().unsqueeze(0)
+            
+        tb.add_image('impute', im_impute, self.global_step)
         
+        # Super resolution!
+        test1 = (self.global_step < 100) and (self.global_step % 10 == 0)
+        test2 = (self.global_step % 100 == 0)
+        if test1 or test2:
+            with torch.no_grad():
+                x,y = tuple(idx0.max(dim=0).values+1)
+                shape_resolve = (10*x, 10*y)
+                idx_resolve = make_idx_from_shape(shape_resolve)
+                y_resolve = self.forward(idx_resolve['coords_rescaled']).squeeze()
+
+                im_resolve = torch.sparse_coo_tensor(
+                    indices = idx_resolve['coords'].T, 
+                    values = y_resolve,
+                    size = shape_resolve,
+                    device = torch.device(DEVICE) #device=DEVICE
+                ).to_dense().unsqueeze(0)
+
+            tb.add_image('super resolution', im_resolve, self.global_step)
         
         return loss
     
