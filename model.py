@@ -43,14 +43,29 @@ class LinearSinus(nn.Module):
             self.linear.weight.uniform_(-k,k)
 
 def make_idx(im_in):
+    #idx = []
+    #x,y = im_in.shape
+    #for i in range(x):
+    #    for j in range(y):
+    #        idx.append((i,j))
+    #idx = torch.tensor(idx, device=DEVICE)
+    #return idx
+    return make_idx_from_shape(im_in.shape)['coords']
+
+def make_idx_from_shape(shape):
+    x,y = shape
     idx = []
-    x,y = im_in.shape
     for i in range(x):
         for j in range(y):
             idx.append((i,j))
     idx = torch.tensor(idx, device=DEVICE)
-    return idx
+    return {'coords':idx, 'coords_rescaled':rescale_coords(idx, shape)}
 
+def rescale_coords(coords, shape):
+    scale = torch.tensor(shape, device=DEVICE)
+    b = (coords / scale)
+    b = (b-.5)/.5
+    return b
         
 class SirenImageLearner(pl.LightningModule):
     def __init__(self, 
