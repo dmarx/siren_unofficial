@@ -1,20 +1,38 @@
 import math
 
+import mlflow
+import mlflow.pytorch
 #import matplotlib.pyplot as plt 
 #import numpy as np
 import torch
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import pytorch_lightning as pl
 
-from torchvision.transforms import ToTensor
+from torchvision.transforms import ToTensor, ToPILImage
 
+from loguru import logger
+import matplotlib.pyplot as plt
 import PIL
 import tqdm
 
+from kornia.losses import psnr_loss, ssim_loss, total_variation, kl_div_loss_2d
+# kornia losses all seem to presume same shape input. Lame. 
+# let's approximate a distributional divergence by taking quantiles 
+# and calculating the area between the quantile curves (i.e. sum over abs differences)
+
 # fuck it...
 DEVICE = 'cuda'
+
+def q_q_distance(t0, t1, n_quantiles=100):
+    q = torch.linspace(0,1,steps=n_quantiles+1, device=DEVICE)[:-1]
+    p0 = t0.quantile(q)
+    p1 = t1.quantile(q)
+    #d = math.sum(math.abs(p0-p1))
+    d = sum(abs(p0-p1))
+    return d
 
 class LinearSinus(nn.Module):
     def __init__(self, in_features, out_features, omega=30, is_first_layer=False):
@@ -73,11 +91,16 @@ class SirenImageLearner(pl.LightningModule):
                  out_features=1,
                  dim_hidden=256,
                  n_hidden=5,
-                 lr=1e-4):
+                 lr=1e-4,
+                 notebook_mode=False
+                ):
         super().__init__()
         
         # getting an error complaining that self.hparams isn't a dict...
         #self.save_hyperparameters() # looks like this doesn't help
+        # improve lighting docs: save_hyperparameters should be referenced in hparam logging, and vice versa
+        # - https://pytorch-lightning.readthedocs.io/en/latest/common/hyperparameters.html#lightningmodule-hyperparameters
+        # - https://pytorch-lightning.readthedocs.io/en/stable/extensions/logging.html#logging-hyperparameters
         
         #self.target_image = target_image
         self.in_features = in_features
@@ -85,6 +108,7 @@ class SirenImageLearner(pl.LightningModule):
         self.dim_hidden = dim_hidden
         self.n_hidden = n_hidden
         self.lr = lr
+        self.notebook_mode = notebook_mode
         
         layers = [
             LinearSinus(
@@ -97,11 +121,46 @@ class SirenImageLearner(pl.LightningModule):
         layers.append(LinearSinus(in_features=dim_hidden, out_features=out_features))
         self.block = nn.Sequential(*layers)
         
+        
+    @property
+    def example_input_array(self):
+        """
+        To compute fwd pass for tensorboard computation graph logging.
+        
+        - https://pytorch-lightning.readthedocs.io/en/latest/api/pytorch_lightning.loggers.tensorboard.html
+        """
+        return torch.ones(self.in_features)
+    
+    @property
+    def default_hp_metric(self):
+        return False
+    
+        
     def forward(self, x):
         return self.block(x)
     
+    def build_image_from_coords(self, pixel_values, coords=None, record=False):
+        
+        if coords is None:
+            idx0 = self._idx0
+        else:
+            idx0 = coords
+
+        im_recons=torch.sparse_coo_tensor(
+            indices=idx0.T, 
+            values=pixel_values,
+            size=tuple(idx0.max(dim=0).values+1),
+            device=torch.device(DEVICE) #device=DEVICE
+        ).to_dense().unsqueeze(0)
+        
+        if record:
+            self._idx0 = coords.clone().detach()
+            self._im_recons = im_recons.clone().detach()
+        
+        return im_recons
+    
     def training_step(self, batch, batch_idx):
-        tb = self.trainer.logger.experiment
+        tb=self.trainer.logger.experiment
 
         y_true = batch['pixel_values'].clone().detach().requires_grad_(True)
         coords_rescaled = batch['coords_rescaled'].clone().detach().requires_grad_(True)
@@ -112,53 +171,96 @@ class SirenImageLearner(pl.LightningModule):
         #tb.add_histogram('loss_grad', loss.grad, batch_idx) # uh....
         self.log("train_loss", loss)
         
-        #######################
-        # Should I be using callbacks for this logging stuff?
-        # I don't want to build these images every step, just when I want to log....
+        if not hasattr(self, '_im_recons'):
+            im_recons = self.build_image_from_coords(y_true, coords=batch['coords'], record=True)
+            tb.add_image('source', im_recons, 0)
+        else:
+            im_recons = self._im_recons
         
-        # fuck it...
-        idx0=batch['coords']
-        im_recons=torch.sparse_coo_tensor(
-            indices=idx0.T, 
-            values=y_true,
-            size=tuple(idx0.max(dim=0).values+1),
-            device=torch.device(DEVICE) #device=DEVICE
-        ).to_dense().unsqueeze(0)
-        
-        tb.add_image('source',im_recons, batch_idx)
-        
-        im_pred = torch.sparse_coo_tensor(
-            indices=idx0.T, 
-            values=y_pred,
-            size=tuple(idx0.max(dim=0).values+1),
-            device=torch.device(DEVICE) #device=DEVICE
-        ).to_dense().unsqueeze(0)
-        
-        tb.add_image('pred', im_pred, self.global_step)
-        
-        # what happens if we generate an image solely using the coordinates between the training points?
-        with torch.no_grad():
-            #shape_orig = tuple(idx0.max(dim=0).values+1)
-            shape_impute = tuple(idx0.max(dim=0).values)
-            idx_impute = make_idx_from_shape(shape_impute)
-            y_impute = self.forward(idx_impute['coords_rescaled']).squeeze()
-            
-            im_impute = torch.sparse_coo_tensor(
-                indices = idx_impute['coords'].T, 
-                values = y_impute,
-                size = shape_impute,
-                device = torch.device(DEVICE) #device=DEVICE
-            ).to_dense().unsqueeze(0)
-            
-        tb.add_image('impute', im_impute, self.global_step)
-        
-        # Super resolution!
-        test1 = (self.global_step < 100) and (self.global_step % 10 == 0)
-        test2 = (self.global_step % 100 == 0)
+        #test1 = (self.global_step < 100) and (self.global_step % 10 == 0)
+        #test2 = (self.global_step % 100 == 0)
+        test1 = False
+        test2 = self.global_step % self.trainer.log_every_n_steps == 0
         if test1 or test2:
+            
+            #######################
+            # Should I be using callbacks for this logging stuff?
+            # I don't want to build these images every step, just when I want to log....
+            
+            #tb, mlf = self.trainer.logger#.experiment
+            #tb=tb.experiment
+            #tb=self.trainer.logger[0].experiment
+            #tb=self.trainer.logger.experiment
+            
+            # fuck it...
+            idx0=batch['coords']
+            #im_recons=torch.sparse_coo_tensor(
+            #    indices=idx0.T, 
+            #    values=y_true,
+            #    size=tuple(idx0.max(dim=0).values+1),
+            #    device=torch.device(DEVICE) #device=DEVICE
+            #).to_dense().unsqueeze(0)
+
+            #image_tag='source'
+            #image = im_recons
+            #tb.add_image(image_tag, image, batch_idx)
+            
+            # to do... write images to disk... ugh, really? blegh.
+            # ...the real PITA here is coming up with dynamic filenames. And writing to disk ofc.
+            #mlf.log_artifact("features.txt", artifact_path="features")
+            # meh, how bad could it be?
+            # ...yeesh. pretty bad. shit's broken fr.
+            
+            #image = image.clone().cpu()
+            #image = ToPILImage()(image)
+            #outname=f'{image_tag}_{self.global_step}.png'
+            #outpath=f'./image_logs/{outname}'
+            #with open(outpath, 'wb') as f:
+            #    image.save(f)
+                #mlf.log_artifact(outname, artifact_path="image_logs", local_path="image_logs")
+            #mlf.experiment.log_artifact(local_path=outpath)
+            #mlf.experiment.log_artifact(run_id=mlf.run_id, local_path=outpath)
+            #logger.info(mlf.experiment.artifact_uri)
+            #mlf.experiment.log_artifact(run_id=mlf.run_id, artifact_path="image_logs", local_path=outpath)
+            #mlf.experiment.log_artifact(outname, artifact_path="image_logs", local_path="image_logs")
+            #mlf.experiment.log_image(image=image, artifact_file=outpath, run_id=mlf.run_id)
+            #mlf.experiment.log_image(image=image, artifact_file=outname, run_id=mlf.run_id)
+
+
+            im_pred = torch.sparse_coo_tensor(
+                indices=idx0.T, 
+                values=y_pred,
+                size=tuple(idx0.max(dim=0).values+1),
+                #requires_grad=False,
+                device=torch.device(DEVICE) #device=DEVICE
+            ).to_dense().unsqueeze(0)
+
+            tb.add_image('pred', im_pred, self.global_step)
+            if self.notebook_mode:
+                plt.imshow(im_pred.detach().squeeze().cpu().numpy())
+                plt.show()
+
+            # what happens if we generate an image solely using the coordinates between the training points?
             with torch.no_grad():
+                #shape_orig = tuple(idx0.max(dim=0).values+1)
+                shape_impute = tuple(idx0.max(dim=0).values)
+                idx_impute = make_idx_from_shape(shape_impute)
+                y_impute = self.forward(idx_impute['coords_rescaled']).squeeze()
+
+                im_impute = torch.sparse_coo_tensor(
+                    indices = idx_impute['coords'].T, 
+                    values = y_impute,
+                    size = shape_impute,
+                    device = torch.device(DEVICE) #device=DEVICE
+                ).to_dense().unsqueeze(0)
+
+            tb.add_image('impute', im_impute, self.global_step)
+
+            # Super resolution!
+            with torch.no_grad():
+                sr_k = 10
                 x,y = tuple(idx0.max(dim=0).values+1)
-                shape_resolve = (10*x, 10*y)
+                shape_resolve = (sr_k*x, sr_k*y)
                 idx_resolve = make_idx_from_shape(shape_resolve)
                 y_resolve = self.forward(idx_resolve['coords_rescaled']).squeeze()
 
@@ -169,20 +271,62 @@ class SirenImageLearner(pl.LightningModule):
                     device = torch.device(DEVICE) #device=DEVICE
                 ).to_dense().unsqueeze(0)
 
-            tb.add_image('super resolution', im_resolve, self.global_step)
+            tb.add_image(f'super resolution - {sr_k}x ', im_resolve, self.global_step)
+        
+                        
+            # psnr_loss, ssim_loss, total_variation
+            tv_pred = total_variation(im_pred)
+            #self.log("tv_pred", tv_pred) # doesn't seem to work right when only calling it when I need it...
+            tb.add_scalar("tv_pred", tv_pred, self.global_step)
+            
+            tv_up_k = total_variation(im_resolve)
+            #self.log(f"tv_super resolution - {sr_k}", tv_pred)
+            tb.add_scalar(f"tv_super resolution - {sr_k}", tv_up_k, self.global_step)
+            
+            psnr_pred = psnr_loss(im_pred, im_recons, max_val=1)
+            #self.log(f"psnr_pred", psnr_pred)
+            #tb.add_scalar("psnr_pred", psnr_pred, self.global_step)
+            # psnr is basically just a rescaled MSE
+            
+            #kl_div_loss_2d(input, target, reduction='mean')
+            
+            # Needs input tensors to be same shape
+            #psnr_up_k = psnr_loss(im_resolve, im_recons, max_val=1)
+            #self.log(f"psnr/super resolution - {sr_k}", psnr_pred)
+            
+            kl_pred = kl_div_loss_2d(im_pred.unsqueeze(0), im_recons.unsqueeze(0))
+            #self.log("kl_pred", kl_pred)
+            #tb.log_metrics({"kl_pred":kl_pred}, step=self.global_step)
+            #tb.scalar("kl_pred", kl_pred, step=self.global_step)
+            tb.add_scalar("kl_pred", kl_pred, self.global_step)
+            
+            # Also needs input tensors to be same shape... blech.
+            #kl_up_k = kl_div_loss_2d(im_resolve.unsqueeze(0), im_recons.unsqueeze(0))
+            #self.log(f"kl/super resolution - {sr_k}", kl_up_k)
+            
+            d_up = q_q_distance(im_resolve, im_recons, n_quantiles=100)
+            tb.add_scalar(f"qq-distance/super resolution - {sr_k}", d_up, self.global_step)
         
         return loss
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        return optimizer
+        #optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        scheduler = CosineAnnealingLR(optimizer, T_max=300)
+        # https://pytorch-lightning.readthedocs.io/en/latest/api/pytorch_lightning.core.lightning.html#pytorch_lightning.core.lightning.LightningModule.configure_optimizers
+        return {'optimizer':optimizer,
+                'lr_scheduler':{
+                    'scheduler':scheduler, # with scheduler, I def want LR logged...
+                    "interval": "step",
+                    }
+               }
 
 
 class SirenImageDataWrapper(pl.LightningDataModule):
     def __init__(self, target_image):
         super().__init__()
         self.target_image = target_image
-    
+
     def prepare_data(self):
         self._scale = torch.tensor(self.target_image.shape, device=DEVICE) - 1
         coords = make_idx(self.target_image)
@@ -219,16 +363,51 @@ class SirenImageDataWrapper(pl.LightningDataModule):
         return self._Loader
     
 if __name__ == '__main__':
+    #logger.debug(mlflow.get_artifact_uri())
+    #mlflow_exprmnt_name = "SIREN-3"
+    #mlflow_tracking_uri = 'sqlite:///../mlflow/mlflow.db'
+    #mlflow.set_artifact_uri('file://../mlflow')
+    #mlflow.set_tracking_uri(mlflow_tracking_uri)
+    #mlflow.set_experiment(mlflow_exprmnt_name+"_outterlogger")
+    #mlflow.pytorch.autolog() # this thing sucks. can't log images with this on.
+    #logger.debug(mlflow.get_artifact_uri())
+
+        
     im_path = '../data/google-photos-export/uncompressed/takeout-20210901T023707Z-001/Takeout/Google Photos/lithophane candidates/20210313_133327.jpg'
     im = PIL.Image.open(im_path)
     im3 = im.resize((122, 163)).convert('L').rotate(-90, expand=True)
     t_im3 = ToTensor()(im3).squeeze()
     
+    from pytorch_lightning.loggers import TensorBoardLogger, MLFlowLogger, WandbLogger
+
+    #wandb_logger = WandbLogger()
+    
+    #logger1 = TensorBoardLogger("tb_logs", name="my_model")
+    tb_logger = TensorBoardLogger("tb_logs", name="siren-upsample")
+    #logger2 = MLFlowLogger(
+    #        experiment_name=mlflow_exprmnt_name+"_sublogger", 
+    #        tracking_uri=mlflow_tracking_uri,
+    #        artifact_location='../mlflow/artifacts/'
+    #)
+    #loggers=[logger1, logger2]
+    #loggers=[logger1]
+    #trainer = Trainer(logger=[logger1, logger2])
+    
     model = SirenImageLearner()
     dm = SirenImageDataWrapper(target_image=t_im3)
+    
+    # https://pytorch-lightning.readthedocs.io/en/latest/common/trainer.html#trainer-flags
     trainer = pl.Trainer(
         gpus=-1,
-        max_steps=1000,
-        log_every_n_steps=50
+        #max_steps=1000,
+        max_steps=100000, # I think there's a way to use CLI args to override here
+        log_every_n_steps=100, #50,
+        #logger=loggers,
+        logger=tb_logger,
+        log_gpu_memory=True, # fuck yeah!
+        weights_summary=None,
     )
+        # shouldn't need to do this...
+    #with mlflow.start_run():
+    #with logger2.experiment.start_run():
     trainer.fit(model, dm)
