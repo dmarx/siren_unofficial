@@ -221,13 +221,27 @@ class SirenImageLearner(pl.LightningModule):
             idx0 = self._idx0
         
         if self.global_step > self.warmup_steps: 
-            y_resolve = self.forward(self._resolve_coords_rescaled).squeeze()
-            d_up = cramer_von_mises_distance(y_resolve, y_true, n_quantiles=100)
+            torch.cuda.empty_cache()
+            
+            with torch.no_grad(): # maybe?
+                y_resolve = self.forward(self._resolve_coords_rescaled).squeeze() # this is actually where the problem error was being thrown :(
+                d_up = cramer_von_mises_distance(y_resolve, y_true, n_quantiles=100) 
+                # .... need the grad for the optimization.
+                # downsample?
+                # yes, definitely yes. Will make this way faster to evaluate too.
+                # being liberal, could just sample as many points as we have in y_true.
+                # could probably get a way with way fewer though, probably something like 5*n_quantiles?
+                # sampling should happen before the forward pass to mitigate memory error,
+                # so sample coordinates to send to the forward pass rather than sampling from
+                # the fully generated output. Start taking advantage of the implicit representation :)
+            # the quantile construction is probably expensive wrt the gradient? ...maybe not.
+            sr_k = self.super_resolution_factor
             tb.add_scalar(f"cramer_von_mises_distance/super resolution - {sr_k}", d_up, self.global_step)
             # calculating it anyway, may as well log it..
         
             loss2 = loss + d_up / self.cvm_alpha
             tb.add_scalar(f"train_loss_plus", loss2, self.global_step)
+            loss=loss2
         
         
         #sr_k = 10        
