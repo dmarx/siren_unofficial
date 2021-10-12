@@ -231,13 +231,17 @@ class SirenImageLearner(pl.LightningModule):
             #######
             #with torch.no_grad(): # maybe?
             x,y = tuple(idx0.max(dim=0).values+1)
-            sr_k = self.super_resolution_factor
+            #sr_k = self.super_resolution_factor
             num_samples = x*y
-            pop_size = num_samples * sr_k * sr_k
-            sampled_coord_idxs = perm_gpu_f32(pop_size, num_samples).long()
-            sampled_coords = self._resolve_coords_rescaled[sampled_coord_idxs, :]
-            # better yet... I should just sample from random uniform, rather than specifically
-            # sampling coordinates from the sr_k upsampled grid.
+            #pop_size = num_samples * sr_k * sr_k
+            #sampled_coord_idxs = perm_gpu_f32(pop_size, num_samples).long()
+            #sampled_coords = self._resolve_coords_rescaled[sampled_coord_idxs, :]
+            # - better yet... I should just sample from random uniform, rather than specifically
+            #   sampling coordinates from the sr_k upsampled grid.
+            #U = torch.rand(x, y, device=DEVICE)
+            U = torch.rand(x*y,2, device=DEVICE)
+            sampled_coords = (U-.5)/.5
+            
 
             #y_resolve = self.forward(self._resolve_coords_rescaled).squeeze() # this is actually where the problem error was being thrown :(
             y_resolve = self.forward(sampled_coords).squeeze() 
@@ -365,13 +369,25 @@ class SirenImageLearner(pl.LightningModule):
     def configure_optimizers(self):
         #optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
-        scheduler = CosineAnnealingLR(optimizer, T_max=300)
+        #optimizer = torch.optim.SGD(self.parameters(), lr=self.lr*5) # does lr here event matter? 
+        # I think SGD LR can be anything with CyclicLR, just some lr needs to be provided.
+        #scheduler = CosineAnnealingLR(optimizer, T_max=300) # disabling because I think SWA will handle this for me
+        #
+        #scheduler = torch.optim.lr_scheduler.CyclicLR(
+        #    optimizer, 
+        #    base_lr=0, #self.lr*1e-3,  #0.001,
+        #    max_lr=self.lr,  #ultimately, this is what controls lr
+        #    step_size_up=10,
+        #    step_size_down=400,#200,
+        #    mode="exp_range",
+        #    cycle_momentum=False, # ugh... need to add this to suppress error. silliness.
+        #    gamma=.996)
         # https://pytorch-lightning.readthedocs.io/en/latest/api/pytorch_lightning.core.lightning.html#pytorch_lightning.core.lightning.LightningModule.configure_optimizers
         return {'optimizer':optimizer,
-                'lr_scheduler':{
-                    'scheduler':scheduler, # with scheduler, I def want LR logged...
-                    "interval": "step",
-                    }
+                #'lr_scheduler':{
+                #    'scheduler':scheduler, # with scheduler, I def want LR logged...
+                #    "interval": "step",
+                #    }
                }
 
 
