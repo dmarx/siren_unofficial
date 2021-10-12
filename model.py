@@ -27,6 +27,10 @@ from kornia.losses import psnr_loss, ssim_loss, total_variation, kl_div_loss_2d
 DEVICE = 'cuda'
 
 def q_q_distance(t0, t1, n_quantiles=100):
+    """
+    Definitely didn't invent this. Closely related to kolmogorov-smirnoff, Kuiper, and
+    Cramer-von Mises statistics. Wasserstein?
+    """
     q = torch.linspace(0,1,steps=n_quantiles+1, device=DEVICE)[:-1]
     p0 = t0.quantile(q)
     p1 = t1.quantile(q)
@@ -34,6 +38,21 @@ def q_q_distance(t0, t1, n_quantiles=100):
     d = sum(abs(p0-p1))
     return d
 
+# fuck it, let's just use cramer von mises
+def cramer_von_mises_distance(t0, t1, n_quantiles=100):
+    """
+    n_quantiles is basically the resolution of the approximation. 
+    More quantiles calculated, the better the approximation,
+    i.e. the higher the resolution of the estimato.
+    """
+    q = torch.linspace(0,1,steps=n_quantiles+1, device=DEVICE)[:-1]
+    p0 = t0.quantile(q)
+    p1 = t1.quantile(q)
+    #d = math.sum(math.abs(p0-p1))
+    sse = (p0-p1).pow(2).mean() #.sum()
+    return sse
+    
+    
 class LinearSinus(nn.Module):
     def __init__(self, in_features, out_features, omega=30, is_first_layer=False):
         super().__init__()
@@ -304,8 +323,9 @@ class SirenImageLearner(pl.LightningModule):
             #kl_up_k = kl_div_loss_2d(im_resolve.unsqueeze(0), im_recons.unsqueeze(0))
             #self.log(f"kl/super resolution - {sr_k}", kl_up_k)
             
-            d_up = q_q_distance(im_resolve, im_recons, n_quantiles=100)
-            tb.add_scalar(f"qq-distance/super resolution - {sr_k}", d_up, self.global_step)
+            #d_up = q_q_distance(im_resolve, im_recons, n_quantiles=100)
+            d_up = cramer_von_mises_distance(im_resolve, im_recons, n_quantiles=100)
+            tb.add_scalar(f"cramer_von_mises_distance/super resolution - {sr_k}", d_up, self.global_step)
         
         return loss
     
