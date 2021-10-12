@@ -112,7 +112,9 @@ class SirenImageLearner(pl.LightningModule):
                  n_hidden=5,
                  lr=1e-4,
                  notebook_mode=False,
-                 super_resolution_factor=10
+                 super_resolution_factor=10,
+                 warmup_steps=500, # 
+                 cvm_alpha = 1000
                 ):
         super().__init__()
         
@@ -130,6 +132,8 @@ class SirenImageLearner(pl.LightningModule):
         self.lr = lr
         self.notebook_mode = notebook_mode
         self.super_resolution_factor = super_resolution_factor
+        self.warmup_steps = warmup_steps
+        self.cvm_alpha = cvm_alpha
         
         layers = [
             LinearSinus(
@@ -193,7 +197,8 @@ class SirenImageLearner(pl.LightningModule):
         self.log("train_loss", loss)
         
         
-        if not hasattr(self, '_im_recons'):
+        #if not hasattr(self, '_im_recons'):
+        if not hasattr(self, '_idx0'):
             im_recons = self.build_image_from_coords(y_true, coords=batch['coords'], record=True)
             tb.add_image('source', im_recons, 0)
             del im_recons
@@ -204,8 +209,8 @@ class SirenImageLearner(pl.LightningModule):
             x,y = tuple(idx0.max(dim=0).values+1)
             shape_resolve = (sr_k*x, sr_k*y)
             idx_resolve = make_idx_from_shape(shape_resolve)
-            with torch.no_grad(): # Maybe this'll suppress the out of memory error?
-                y_resolve = self.forward(idx_resolve['coords_rescaled']).squeeze()
+            #with torch.no_grad(): # Maybe this'll suppress the out of memory error?
+            #    y_resolve = self.forward(idx_resolve['coords_rescaled']).squeeze()
             
             self._resolve_coords = idx_resolve['coords']#.clone()
             self._resolve_coords_rescaled = idx_resolve['coords_rescaled']#.clone()
@@ -214,17 +219,15 @@ class SirenImageLearner(pl.LightningModule):
         else:
             #im_recons = self._im_recons
             idx0 = self._idx0
+        
+        if self.global_step > self.warmup_steps: 
             y_resolve = self.forward(self._resolve_coords_rescaled).squeeze()
-            
-        #im_pred = self.build_image_from_coords(y_true)
+            d_up = cramer_von_mises_distance(y_resolve, y_true, n_quantiles=100)
+            tb.add_scalar(f"cramer_von_mises_distance/super resolution - {sr_k}", d_up, self.global_step)
+            # calculating it anyway, may as well log it..
         
-        #d_up = cramer_von_mises_distance(im_resolve, im_recons, n_quantiles=100)
-        #tb.add_scalar(f"cramer_von_mises_distance/super resolution - {sr_k}", d_up, self.global_step)
-        d_up = cramer_von_mises_distance(y_resolve, y_true, n_quantiles=100)
-        #self.log(f"cramer_von_mises_distance/super resolution - {sr_k}", d_up)
-        tb.add_scalar(f"cramer_von_mises_distance/super resolution - {sr_k}", d_up, self.global_step)
-        # calculating it anyway, may as well log it..
-        
+            loss2 = loss + d_up / self.cvm_alpha
+            tb.add_scalar(f"train_loss_plus", loss2, self.global_step)
         
         
         #sr_k = 10        
