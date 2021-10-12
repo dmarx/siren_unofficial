@@ -371,7 +371,9 @@ class SirenImageLearner(pl.LightningModule):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
         #optimizer = torch.optim.SGD(self.parameters(), lr=self.lr*5) # does lr here event matter? 
         # I think SGD LR can be anything with CyclicLR, just some lr needs to be provided.
-        #scheduler = CosineAnnealingLR(optimizer, T_max=300) # disabling because I think SWA will handle this for me
+        scheduler = CosineAnnealingLR(optimizer, T_max=300) 
+        # disabling because I think SWA will handle this for me
+        # .... false. Or rather, SWA only adds lr annealing when it actually kicks in.
         #
         #scheduler = torch.optim.lr_scheduler.CyclicLR(
         #    optimizer, 
@@ -384,10 +386,10 @@ class SirenImageLearner(pl.LightningModule):
         #    gamma=.996)
         # https://pytorch-lightning.readthedocs.io/en/latest/api/pytorch_lightning.core.lightning.html#pytorch_lightning.core.lightning.LightningModule.configure_optimizers
         return {'optimizer':optimizer,
-                #'lr_scheduler':{
-                #    'scheduler':scheduler, # with scheduler, I def want LR logged...
-                #    "interval": "step",
-                #    }
+                'lr_scheduler':{
+                    'scheduler':scheduler, # with scheduler, I def want LR logged...
+                    "interval": "step",
+                    }
                }
 
 
