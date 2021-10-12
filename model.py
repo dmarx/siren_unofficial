@@ -52,6 +52,11 @@ def cramer_von_mises_distance(t0, t1, n_quantiles=100):
     sse = (p0-p1).pow(2).mean() #.sum()
     return sse
     
+# https://discuss.pytorch.org/t/torch-equivalent-of-numpy-random-choice/16146/19
+def perm_gpu_f32(pop_size, num_samples):
+    """Use torch.randperm to generate indices on a 32-bit GPU tensor."""
+    return torch.randperm(pop_size, dtype=torch.int32, device='cuda')[:num_samples]
+
     
 class LinearSinus(nn.Module):
     def __init__(self, in_features, out_features, omega=30, is_first_layer=False):
@@ -223,17 +228,29 @@ class SirenImageLearner(pl.LightningModule):
         if self.global_step > self.warmup_steps: 
             torch.cuda.empty_cache()
             
-            with torch.no_grad(): # maybe?
-                y_resolve = self.forward(self._resolve_coords_rescaled).squeeze() # this is actually where the problem error was being thrown :(
-                d_up = cramer_von_mises_distance(y_resolve, y_true, n_quantiles=100) 
-                # .... need the grad for the optimization.
-                # downsample?
-                # yes, definitely yes. Will make this way faster to evaluate too.
-                # being liberal, could just sample as many points as we have in y_true.
-                # could probably get a way with way fewer though, probably something like 5*n_quantiles?
-                # sampling should happen before the forward pass to mitigate memory error,
-                # so sample coordinates to send to the forward pass rather than sampling from
-                # the fully generated output. Start taking advantage of the implicit representation :)
+            #######
+            #with torch.no_grad(): # maybe?
+            x,y = tuple(idx0.max(dim=0).values+1)
+            sr_k = self.super_resolution_factor
+            num_samples = x*y
+            pop_size = num_samples * sr_k * sr_k
+            sampled_coord_idxs = perm_gpu_f32(pop_size, num_samples).long()
+            sampled_coords = self._resolve_coords_rescaled[sampled_coord_idxs, :]
+
+            #y_resolve = self.forward(self._resolve_coords_rescaled).squeeze() # this is actually where the problem error was being thrown :(
+            y_resolve = self.forward(sampled_coords).squeeze() 
+            d_up = cramer_von_mises_distance(y_resolve, y_true, n_quantiles=100) 
+            # .... need the grad for the optimization.
+            # downsample?
+            # yes, definitely yes. Will make this way faster to evaluate too.
+            # being liberal, could just sample as many points as we have in y_true.
+            # could probably get a way with way fewer though, probably something like 5*n_quantiles?
+            # sampling should happen before the forward pass to mitigate memory error,
+            # so sample coordinates to send to the forward pass rather than sampling from
+            # the fully generated output. Start taking advantage of the implicit representation :)
+            #
+            # https://discuss.pytorch.org/t/torch-equivalent-of-numpy-random-choice/16146/19
+            #######
             # the quantile construction is probably expensive wrt the gradient? ...maybe not.
             sr_k = self.super_resolution_factor
             tb.add_scalar(f"cramer_von_mises_distance/super resolution - {sr_k}", d_up, self.global_step)
