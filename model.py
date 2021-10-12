@@ -236,6 +236,8 @@ class SirenImageLearner(pl.LightningModule):
             pop_size = num_samples * sr_k * sr_k
             sampled_coord_idxs = perm_gpu_f32(pop_size, num_samples).long()
             sampled_coords = self._resolve_coords_rescaled[sampled_coord_idxs, :]
+            # better yet... I should just sample from random uniform, rather than specifically
+            # sampling coordinates from the sr_k upsampled grid.
 
             #y_resolve = self.forward(self._resolve_coords_rescaled).squeeze() # this is actually where the problem error was being thrown :(
             y_resolve = self.forward(sampled_coords).squeeze() 
