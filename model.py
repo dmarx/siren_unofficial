@@ -111,7 +111,8 @@ class SirenImageLearner(pl.LightningModule):
                  dim_hidden=256,
                  n_hidden=5,
                  lr=1e-4,
-                 notebook_mode=False
+                 notebook_mode=False,
+                 super_resolution_factor=10
                 ):
         super().__init__()
         
@@ -128,6 +129,7 @@ class SirenImageLearner(pl.LightningModule):
         self.n_hidden = n_hidden
         self.lr = lr
         self.notebook_mode = notebook_mode
+        self.super_resolution_factor = super_resolution_factor
         
         layers = [
             LinearSinus(
@@ -173,8 +175,8 @@ class SirenImageLearner(pl.LightningModule):
         ).to_dense().unsqueeze(0)
         
         if record:
-            self._idx0 = coords.clone().detach()
-            self._im_recons = im_recons.clone().detach()
+            self._idx0 = coords#.clone().detach()
+            #self._im_recons = im_recons#.clone().detach()
         
         return im_recons
     
@@ -190,69 +192,64 @@ class SirenImageLearner(pl.LightningModule):
         #tb.add_histogram('loss_grad', loss.grad, batch_idx) # uh....
         self.log("train_loss", loss)
         
+        
         if not hasattr(self, '_im_recons'):
             im_recons = self.build_image_from_coords(y_true, coords=batch['coords'], record=True)
             tb.add_image('source', im_recons, 0)
+            del im_recons
+            torch.cuda.empty_cache()
+            
+            idx0 = self._idx0
+            sr_k = self.super_resolution_factor
+            x,y = tuple(idx0.max(dim=0).values+1)
+            shape_resolve = (sr_k*x, sr_k*y)
+            idx_resolve = make_idx_from_shape(shape_resolve)
+            with torch.no_grad(): # Maybe this'll suppress the out of memory error?
+                y_resolve = self.forward(idx_resolve['coords_rescaled']).squeeze()
+            
+            self._resolve_coords = idx_resolve['coords']#.clone()
+            self._resolve_coords_rescaled = idx_resolve['coords_rescaled']#.clone()
+            
+            
         else:
-            im_recons = self._im_recons
+            #im_recons = self._im_recons
+            idx0 = self._idx0
+            y_resolve = self.forward(self._resolve_coords_rescaled).squeeze()
+            
+        #im_pred = self.build_image_from_coords(y_true)
+        
+        #d_up = cramer_von_mises_distance(im_resolve, im_recons, n_quantiles=100)
+        #tb.add_scalar(f"cramer_von_mises_distance/super resolution - {sr_k}", d_up, self.global_step)
+        d_up = cramer_von_mises_distance(y_resolve, y_true, n_quantiles=100)
+        #self.log(f"cramer_von_mises_distance/super resolution - {sr_k}", d_up)
+        tb.add_scalar(f"cramer_von_mises_distance/super resolution - {sr_k}", d_up, self.global_step)
+        # calculating it anyway, may as well log it..
+        
+        
+        
+        #sr_k = 10        
+  
+
+        
         
         #test1 = (self.global_step < 100) and (self.global_step % 10 == 0)
         #test2 = (self.global_step % 100 == 0)
         test1 = False
         test2 = self.global_step % self.trainer.log_every_n_steps == 0
         if test1 or test2:
+            #idx0=batch['coords']
             
-            #######################
-            # Should I be using callbacks for this logging stuff?
-            # I don't want to build these images every step, just when I want to log....
-            
-            #tb, mlf = self.trainer.logger#.experiment
-            #tb=tb.experiment
-            #tb=self.trainer.logger[0].experiment
-            #tb=self.trainer.logger.experiment
-            
-            # fuck it...
-            idx0=batch['coords']
-            #im_recons=torch.sparse_coo_tensor(
+
+
+            #im_pred = torch.sparse_coo_tensor(
             #    indices=idx0.T, 
-            #    values=y_true,
+            #    values=y_pred,
             #    size=tuple(idx0.max(dim=0).values+1),
+            #    #requires_grad=False,
             #    device=torch.device(DEVICE) #device=DEVICE
             #).to_dense().unsqueeze(0)
-
-            #image_tag='source'
-            #image = im_recons
-            #tb.add_image(image_tag, image, batch_idx)
-            
-            # to do... write images to disk... ugh, really? blegh.
-            # ...the real PITA here is coming up with dynamic filenames. And writing to disk ofc.
-            #mlf.log_artifact("features.txt", artifact_path="features")
-            # meh, how bad could it be?
-            # ...yeesh. pretty bad. shit's broken fr.
-            
-            #image = image.clone().cpu()
-            #image = ToPILImage()(image)
-            #outname=f'{image_tag}_{self.global_step}.png'
-            #outpath=f'./image_logs/{outname}'
-            #with open(outpath, 'wb') as f:
-            #    image.save(f)
-                #mlf.log_artifact(outname, artifact_path="image_logs", local_path="image_logs")
-            #mlf.experiment.log_artifact(local_path=outpath)
-            #mlf.experiment.log_artifact(run_id=mlf.run_id, local_path=outpath)
-            #logger.info(mlf.experiment.artifact_uri)
-            #mlf.experiment.log_artifact(run_id=mlf.run_id, artifact_path="image_logs", local_path=outpath)
-            #mlf.experiment.log_artifact(outname, artifact_path="image_logs", local_path="image_logs")
-            #mlf.experiment.log_image(image=image, artifact_file=outpath, run_id=mlf.run_id)
-            #mlf.experiment.log_image(image=image, artifact_file=outname, run_id=mlf.run_id)
-
-
-            im_pred = torch.sparse_coo_tensor(
-                indices=idx0.T, 
-                values=y_pred,
-                size=tuple(idx0.max(dim=0).values+1),
-                #requires_grad=False,
-                device=torch.device(DEVICE) #device=DEVICE
-            ).to_dense().unsqueeze(0)
+            #im_pred = self.build_image_from_coords(y_true, coords=batch['coords'])
+            im_pred = self.build_image_from_coords(y_true)
 
             tb.add_image('pred', im_pred, self.global_step)
             if self.notebook_mode:
@@ -302,7 +299,7 @@ class SirenImageLearner(pl.LightningModule):
             #self.log(f"tv_super resolution - {sr_k}", tv_pred)
             tb.add_scalar(f"tv_super resolution - {sr_k}", tv_up_k, self.global_step)
             
-            psnr_pred = psnr_loss(im_pred, im_recons, max_val=1)
+            #psnr_pred = psnr_loss(im_pred, im_recons, max_val=1)
             #self.log(f"psnr_pred", psnr_pred)
             #tb.add_scalar("psnr_pred", psnr_pred, self.global_step)
             # psnr is basically just a rescaled MSE
@@ -313,19 +310,19 @@ class SirenImageLearner(pl.LightningModule):
             #psnr_up_k = psnr_loss(im_resolve, im_recons, max_val=1)
             #self.log(f"psnr/super resolution - {sr_k}", psnr_pred)
             
-            kl_pred = kl_div_loss_2d(im_pred.unsqueeze(0), im_recons.unsqueeze(0))
+            #kl_pred = kl_div_loss_2d(im_pred.unsqueeze(0), im_recons.unsqueeze(0))
             #self.log("kl_pred", kl_pred)
             #tb.log_metrics({"kl_pred":kl_pred}, step=self.global_step)
             #tb.scalar("kl_pred", kl_pred, step=self.global_step)
-            tb.add_scalar("kl_pred", kl_pred, self.global_step)
+            #tb.add_scalar("kl_pred", kl_pred, self.global_step)
             
             # Also needs input tensors to be same shape... blech.
             #kl_up_k = kl_div_loss_2d(im_resolve.unsqueeze(0), im_recons.unsqueeze(0))
             #self.log(f"kl/super resolution - {sr_k}", kl_up_k)
             
             #d_up = q_q_distance(im_resolve, im_recons, n_quantiles=100)
-            d_up = cramer_von_mises_distance(im_resolve, im_recons, n_quantiles=100)
-            tb.add_scalar(f"cramer_von_mises_distance/super resolution - {sr_k}", d_up, self.global_step)
+            #d_up = cramer_von_mises_distance(im_resolve, im_recons, n_quantiles=100)
+            #tb.add_scalar(f"cramer_von_mises_distance/super resolution - {sr_k}", d_up, self.global_step)
         
         return loss
     
